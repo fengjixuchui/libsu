@@ -16,6 +16,8 @@
 
 package com.topjohnwu.superuser.internal;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import android.text.TextUtils;
 
 import androidx.annotation.NonNull;
@@ -37,8 +39,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import static com.topjohnwu.superuser.internal.Utils.UTF_8;
-
 class ShellTerminatedException extends IOException {
 
     ShellTerminatedException() {
@@ -47,13 +47,11 @@ class ShellTerminatedException extends IOException {
 }
 
 class ShellImpl extends Shell {
-    private static final String TAG = "SHELLIMPL";
-
     private int status;
 
     final ExecutorService executor;
     final boolean redirect;
-    private final Process process;
+    private final Process proc;
     private final NoCloseOutputStream STDIN;
     private final NoCloseInputStream STDOUT;
     private final NoCloseInputStream STDERR;
@@ -93,25 +91,20 @@ class ShellImpl extends Shell {
         }
     }
 
-    ShellImpl(long timeout, boolean redirect, String... cmd) throws IOException {
+    ShellImpl(BuilderImpl builder, Process process) throws IOException {
         status = UNKNOWN;
-        this.redirect = redirect;
-
-        Utils.log(TAG, "exec " + TextUtils.join(" ", cmd));
-        process = Runtime.getRuntime().exec(cmd);
+        redirect = builder.hasFlags(FLAG_REDIRECT_STDERR);
+        proc = process;
         STDIN = new NoCloseOutputStream(process.getOutputStream());
         STDOUT = new NoCloseInputStream(process.getInputStream());
         STDERR = new NoCloseInputStream(process.getErrorStream());
         executor = new SerialExecutorService();
 
-        if (cmd.length >= 2 && TextUtils.equals(cmd[1], "--mount-master"))
-            status = ROOT_MOUNT_MASTER;
-
         // Shell checks might get stuck indefinitely
-        Future<Void> check = executor.submit(this::shellCheck);
+        Future<Integer> check = executor.submit(this::shellCheck);
         try {
             try {
-                check.get(timeout, TimeUnit.SECONDS);
+                status = check.get(builder.timeout, TimeUnit.SECONDS);
             } catch (ExecutionException e) {
                 Throwable cause = e.getCause();
                 if (cause instanceof IOException) {
@@ -120,9 +113,9 @@ class ShellImpl extends Shell {
                     throw new IOException("Unknown ExecutionException", cause);
                 }
             } catch (TimeoutException e) {
-                throw new IOException("Shell timeout", e);
+                throw new IOException("Shell check timeout", e);
             } catch (InterruptedException e) {
-                throw new IOException("Shell initialization interrupted", e);
+                throw new IOException("Shell check interrupted", e);
             }
         } catch (IOException e) {
             executor.shutdownNow();
@@ -131,11 +124,19 @@ class ShellImpl extends Shell {
         }
     }
 
-    private Void shellCheck() throws IOException {
+    private Integer shellCheck() throws IOException {
+        try {
+            proc.exitValue();
+            throw new IOException("Created process has terminated");
+        } catch (IllegalThreadStateException ignored) {
+            // Process is alive
+        }
+
         // Clean up potential garbage from InputStreams
         ShellUtils.cleanInputStream(STDOUT);
         ShellUtils.cleanInputStream(STDERR);
 
+        int status = NON_ROOT_SHELL;
         try (BufferedReader br = new BufferedReader(new InputStreamReader(STDOUT))) {
 
             STDIN.write(("echo SHELL_TEST\n").getBytes(UTF_8));
@@ -143,20 +144,31 @@ class ShellImpl extends Shell {
             String s = br.readLine();
             if (TextUtils.isEmpty(s) || !s.contains("SHELL_TEST"))
                 throw new IOException("Created process is not a shell");
-            int status = NON_ROOT_SHELL;
 
             STDIN.write(("id\n").getBytes(UTF_8));
             STDIN.flush();
             s = br.readLine();
-            if (!TextUtils.isEmpty(s) && s.contains("uid=0"))
+            if (!TextUtils.isEmpty(s) && s.contains("uid=0")) {
                 status = ROOT_SHELL;
+                Utils.setConfirmedRootState(true);
+                // noinspection ConstantConditions
+                String cwd = ShellUtils.escapedString(System.getProperty("user.dir"));
+                STDIN.write(("cd " + cwd + "\n").getBytes(UTF_8));
+                STDIN.flush();
+            }
 
-            if (status == ROOT_SHELL && this.status == ROOT_MOUNT_MASTER)
-                status = ROOT_MOUNT_MASTER;
-
-            this.status = status;
+            if (status == ROOT_SHELL) {
+                STDIN.write(("readlink /proc/self/ns/mnt\n").getBytes(UTF_8));
+                STDIN.flush();
+                s = br.readLine();
+                STDIN.write(("readlink /proc/1/ns/mnt\n").getBytes(UTF_8));
+                STDIN.flush();
+                String s2 = br.readLine();
+                if (!TextUtils.isEmpty(s) && !TextUtils.isEmpty(s2) && TextUtils.equals(s, s2))
+                    status = ROOT_MOUNT_MASTER;
+            }
         }
-        return null;
+        return status;
     }
 
     private void release() {
@@ -164,7 +176,7 @@ class ShellImpl extends Shell {
         try { STDIN.close0(); } catch (IOException ignored) {}
         try { STDERR.close0(); } catch (IOException ignored) {}
         try { STDOUT.close0(); } catch (IOException ignored) {}
-        process.destroy();
+        proc.destroy();
     }
 
     @Override
@@ -201,7 +213,7 @@ class ShellImpl extends Shell {
             return false;
 
         try {
-            process.exitValue();
+            proc.exitValue();
             // Process is dead, shell is not alive
             return false;
         } catch (IllegalThreadStateException e) {

@@ -16,11 +16,12 @@
 
 package com.topjohnwu.superuser.internal;
 
+import static com.topjohnwu.superuser.internal.IOFactory.JUNK;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import android.content.Context;
 import android.system.ErrnoException;
 import android.system.Os;
-
-import androidx.annotation.RequiresApi;
 
 import com.topjohnwu.superuser.Shell;
 import com.topjohnwu.superuser.io.SuFile;
@@ -28,6 +29,7 @@ import com.topjohnwu.superuser.io.SuFile;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.UUID;
@@ -36,11 +38,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import static com.topjohnwu.superuser.internal.IOFactory.JUNK;
-import static com.topjohnwu.superuser.internal.Utils.UTF_8;
-
-@RequiresApi(21)
-class FifoOutputStream extends BaseSuOutputStream {
+class FifoOutputStream extends FilterOutputStream {
 
     // Set a reasonable timeout here. It is possible that `cat` failed, and the
     // FIFO cannot be opened on our side without blocking forever.
@@ -49,9 +47,12 @@ class FifoOutputStream extends BaseSuOutputStream {
     static final byte[] END_CMD = "echo\n".getBytes(UTF_8);
 
     private final File fifo;
+    private boolean append;
 
     FifoOutputStream(SuFile file, boolean append) throws FileNotFoundException {
-        super(file, append);
+        super(null);
+        this.append = append;
+        checkFile(file);
 
         Context c = Utils.getDeContext(Utils.getContext());
         fifo = new File(c.getCacheDir(), UUID.randomUUID().toString());
@@ -72,12 +73,26 @@ class FifoOutputStream extends BaseSuOutputStream {
         }
     }
 
+    private void checkFile(SuFile file) throws FileNotFoundException {
+        if (file.isDirectory())
+            throw new FileNotFoundException(file.getAbsolutePath() + " is not a file but a directory");
+        if (file.isBlock() || file.isCharacter()) {
+            append = false;
+        }
+        if (append && !file.canWrite() && !file.createNewFile()) {
+            throw new FileNotFoundException("Can write to file " + file.getAbsolutePath());
+        } else if (!file.clear()) {
+            throw new FileNotFoundException("Failed to clear file " + file.getAbsolutePath());
+        }
+    }
+
     private void openStream(SuFile file) throws FileNotFoundException {
         try {
-            Shell.getShell().execTask((in, out, err) -> {
-                String cmd = "cat " + fifo + op() + file.getEscapedPath() + " 2>/dev/null &\n";
+            file.getShell().execTask((in, out, err) -> {
+                String cmd = "cat " + fifo + op() + file.getEscapedPath() + " 2>/dev/null &";
                 Utils.log(TAG, cmd);
                 in.write(cmd.getBytes(UTF_8));
+                in.write('\n');
                 in.flush();
                 in.write(END_CMD);
                 in.flush();
@@ -104,9 +119,21 @@ class FifoOutputStream extends BaseSuOutputStream {
         }
     }
 
+    private String op() {
+        return append ? " >> " : " > ";
+    }
+
+    @Override
+    public void write(byte[] b, int off, int len) throws IOException {
+        out.write(b, off, len);
+    }
+
     @Override
     public void close() throws IOException {
-        super.close();
-        fifo.delete();
+        try {
+            super.close();
+        } finally {
+            fifo.delete();
+        }
     }
 }

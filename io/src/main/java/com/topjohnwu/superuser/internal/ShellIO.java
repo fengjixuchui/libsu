@@ -17,11 +17,10 @@
 package com.topjohnwu.superuser.internal;
 
 import static com.topjohnwu.superuser.internal.IOFactory.JUNK;
-import static com.topjohnwu.superuser.internal.Utils.UTF_8;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import androidx.annotation.NonNull;
 
-import com.topjohnwu.superuser.Shell;
 import com.topjohnwu.superuser.ShellUtils;
 import com.topjohnwu.superuser.io.SuFile;
 import com.topjohnwu.superuser.io.SuRandomAccessFile;
@@ -92,7 +91,7 @@ class ShellIO extends SuRandomAccessFile implements DataInputImpl, DataOutputImp
     }
 
     private void write0(@NonNull byte[] b, int off, int len) throws IOException {
-        Shell.getShell().execTask((in, out, err) -> {
+        file.getShell().execTask((in, out, err) -> {
             String cmd;
             if (fileOff == 0) {
                 cmd = String.format(Locale.ROOT,
@@ -103,22 +102,6 @@ class ShellIO extends SuRandomAccessFile implements DataInputImpl, DataOutputImp
                         "dd of=%s ibs=%d count=1 obs=%d seek=1 %s 2>/dev/null; echo\n",
                         file.getEscapedPath(), len, fileOff, getConv());
             }
-            Utils.log(TAG, cmd);
-            in.write(cmd.getBytes(UTF_8));
-            in.flush();
-            in.write(b, off, len);
-            in.flush();
-            // Wait till the operation is done
-            out.read(JUNK);
-        });
-        fileOff += len;
-    }
-
-    // Optimized for internal appending streams
-    void streamWrite(byte[] b, int off, int len) throws IOException {
-        Shell.getShell().execTask((in, out, err) -> {
-            String cmd = String.format(Locale.ROOT,
-                    "dd bs=%d count=1 >> %s 2>/dev/null; echo\n", len, file.getEscapedPath());
             Utils.log(TAG, cmd);
             in.write(cmd.getBytes(UTF_8));
             in.flush();
@@ -175,17 +158,6 @@ class ShellIO extends SuRandomAccessFile implements DataInputImpl, DataOutputImp
         return len == 0 ? -1 : len;
     }
 
-    // assert fileOff % b.length == 0
-    // Optimized for internal aligned buffered streams
-    int streamRead(byte[] b) throws IOException {
-        int len = alignedRead(b, 0, 1, (int) (fileOff / b.length), b.length);
-        if (len > 0) {
-            fileOff += len;
-            return len;
-        }
-        return -1;
-    }
-
     // return actual bytes read, always >= 0
     protected int alignedRead(byte[] b, int _off, int count, int skip, int bs) throws IOException {
         // fail fast
@@ -193,7 +165,7 @@ class ShellIO extends SuRandomAccessFile implements DataInputImpl, DataOutputImp
             return 0;
         int[] total = new int[1];
         int len = count * bs;
-        Shell.getShell().execTask((in, out, err) -> {
+        file.getShell().execTask((in, out, err) -> {
             int off = _off;
             String cmd = String.format(Locale.ROOT,
                     "dd if=%s ibs=%d skip=%d count=%d obs=%d 2>/dev/null; echo >&2\n",
@@ -275,7 +247,7 @@ class ShellIO extends SuRandomAccessFile implements DataInputImpl, DataOutputImp
                 throw new IOException("Cannot clear file");
             return;
         }
-        Shell.getShell().execTask((in, out, err) -> {
+        file.getShell().execTask((in, out, err) -> {
             String cmd = String.format(Locale.ROOT,
                     "dd of=%s bs=%d seek=1 count=0 2>/dev/null; echo\n",
                     file.getEscapedPath(), newLength);

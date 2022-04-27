@@ -25,14 +25,17 @@ import android.content.ServiceConnection;
 import android.os.IBinder;
 import android.os.Messenger;
 
-import androidx.annotation.CallSuper;
 import androidx.annotation.MainThread;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
+import com.topjohnwu.superuser.Shell;
 import com.topjohnwu.superuser.internal.RootServiceManager;
 import com.topjohnwu.superuser.internal.RootServiceServer;
 import com.topjohnwu.superuser.internal.UiThreadHandler;
+import com.topjohnwu.superuser.internal.Utils;
 
+import java.io.IOException;
 import java.util.concurrent.Executor;
 
 /**
@@ -49,36 +52,51 @@ import java.util.concurrent.Executor;
  * {@link Messenger} or AIDL to define the IPC interface for communication. Please read the
  * official documentations for more details.
  * <p>
- * Even though a {@code RootService} is a {@link Context} of the app package, since we are running
- * in a root environment and the ContextImpl is not constructed in the "normal" way, the
- * functionality of this context is much more limited compared to normal non-root cases. Be aware
- * of this and do not assume all context methods will work, many will result in Exceptions.
+ * Even though a {@code RootService} is a {@link Context} of your application, the ContextImpl
+ * is not constructed in a normal way, so the functionality is much more limited compared
+ * to the normal case. Be aware of this and do not expect all context methods to work.
  * <p>
- * <strong>Daemon mode:</strong><br>
- * By default, the root service will be destroyed when no components are bound to it
- * (including when the non-root app process is terminated). However, if you'd like to have
- * the root service run independently of the app's lifecycle (aka "Daemon Mode"), override the
- * method {@link #onUnbind(Intent)} and return {@code true}. Subsequent bindings will call
- * the {@link #onRebind(Intent)} method.
+ * All RootServices launched from the same process will run in the same root process.
+ * A root service will be destroyed as soon as there are no clients bound to it.
+ * This means all services will be destroyed immediately when the client process is terminated.
+ * The library will NOT attempt to automatically restart and bind to a service after it was unbound.
  * <p>
- * All RootServices of an app will run in the same root process, as root processes are launched
- * per package. The root service process will terminate in the following conditions:
+ * <strong>Daemon Mode:</strong><br>
+ * If you want the service to run in the background independent from the application lifecycle,
+ * launch the service in "Daemon Mode". Check the description of {@link #CATEGORY_DAEMON_MODE}
+ * for instructions on how to do so.
+ * All services running in "Daemon Mode" will run in a daemon process created per-package that
+ * is separate from regular root services. This daemon process will be used across application
+ * re-launches, and even across different users on the device.
+ * A root service running in "Daemon Mode" will be destroyed when any client called
+ * {@link #stop(Intent)}, or the root service itself called {@link #stopSelf()}.
+ * <p>
+ * A root service process, including the daemon process, will terminate under these conditions:
  * <ul>
- *     <li>When the application is updated/deleted</li>
- *     <li>When all services are destroyed (after {@link #onDestroy()} is called)</li>
- *     <li>Non-daemon services will be automatically destroyed when all clients are
- *         unbounded or terminated</li>
- *     <li>Daemon services will only be destroyed when the client called {@link #stop(Intent)}
- *         or the root service called {@link #stopSelf()}</li>
+ *     <li>When the application is updated or deleted</li>
+ *     <li>When all services running in the process are destroyed
+ *         (after {@link #onDestroy()} is called)</li>
  * </ul>
- * The library will NOT attempt to automatically restart and bind to services under any circumstance.
  * @see <a href="https://developer.android.com/guide/components/bound-services">Bound services</a>
  * @see <a href="https://developer.android.com/guide/components/aidl">Android Interface Definition Language (AIDL)</a>
  */
 public abstract class RootService extends ContextWrapper {
 
     /**
-     * Connect to a root service, creating if needed.
+     * Launch the service in "Daemon Mode".
+     * <p>
+     * Add this category in the intent passed to {@link #bind(Intent, ServiceConnection)},
+     * {@link #bind(Intent, Executor, ServiceConnection)}, or
+     * {@link #bindOrTask(Intent, Executor, ServiceConnection)}
+     * to have the service launch in "Daemon Mode".
+     * This category also has to be added in the intent passed to {@link #stop(Intent)}
+     * and {@link #stopOrTask(Intent)} in order to refer to a daemon service instead of
+     * a regular root service.
+     */
+    public static final String CATEGORY_DAEMON_MODE = "com.topjohnwu.superuser.DAEMON_MODE";
+
+    /**
+     * Bind to a root service, launching a new root process if needed.
      * @param intent identifies the service to connect to.
      * @param executor callbacks on ServiceConnection will be called on this executor.
      * @param conn receives information as the service is started and stopped.
@@ -89,11 +107,16 @@ public abstract class RootService extends ContextWrapper {
             @NonNull Intent intent,
             @NonNull Executor executor,
             @NonNull ServiceConnection conn) {
-        RootServiceManager.getInstance().bind(intent, executor, conn);
+        if (!Utils.isRootPossible())
+            return;
+        Shell.Task task = bindOrTask(intent, executor, conn);
+        if (task != null) {
+            Shell.EXECUTOR.execute(asRunnable(task));
+        }
     }
 
     /**
-     * Connect to a root service, creating if needed.
+     * Bind to a root service, launching a new root process if needed.
      * @param intent identifies the service to connect to.
      * @param conn receives information as the service is started and stopped.
      * @see Context#bindService(Intent, ServiceConnection, int)
@@ -104,8 +127,29 @@ public abstract class RootService extends ContextWrapper {
     }
 
     /**
-     * Disconnect from a root service.
-     * @param conn the connection interface previously supplied to {@link #bind(Intent, ServiceConnection)}
+     * Bind to a root service, creating a task to launch a new root process if needed.
+     * <p>
+     * If the application is already connected to a root process, binding will happen immediately
+     * and this method will return {@code null}. Or else this method returns a {@link Shell.Task}
+     * that has to be executed to launch the root process. Binding will only happen after the
+     * developer has executed the returned task with {@link Shell#execTask(Shell.Task)}.
+     * @return the task to launch a root process. If there is no need to launch a new root
+     * process, {@code null} is returned.
+     * @see #bind(Intent, Executor, ServiceConnection)
+     */
+    @MainThread
+    @Nullable
+    public static Shell.Task bindOrTask(
+            @NonNull Intent intent,
+            @NonNull Executor executor,
+            @NonNull ServiceConnection conn) {
+        return RootServiceManager.getInstance().createBindTask(intent, executor, conn);
+    }
+
+    /**
+     * Unbind from a root service.
+     * @param conn the connection interface previously supplied to
+     * {@link #bind(Intent, ServiceConnection)}
      * @see Context#unbindService(ServiceConnection)
      */
     @MainThread
@@ -114,18 +158,48 @@ public abstract class RootService extends ContextWrapper {
     }
 
     /**
-     * Force stop a root service.
+     * Force stop a root service, launching a new root process if needed.
      * <p>
-     * Since root services are bound only, unlike {@link Context#stopService(Intent)}, this
-     * method is used to immediately stop a root service regardless of its state.
-     * Only use this method to stop a daemon root service; for normal root services please use
-     * {@link #unbind(ServiceConnection)} instead as this method could potentially end up starting
-     * an additional root process to make sure daemon services are stopped.
+     * This method is used to immediately stop a root service regardless of its state.
+     * ONLY use this method to stop a daemon root service; for normal root services, please use
+     * {@link #unbind(ServiceConnection)} instead as this method has to potentially launch
+     * an additional root process to ensure daemon services are stopped.
      * @param intent identifies the service to stop.
      */
     @MainThread
     public static void stop(@NonNull Intent intent) {
-        RootServiceManager.getInstance().stop(intent);
+        if (!Utils.isRootPossible())
+            return;
+        Shell.Task task = stopOrTask(intent);
+        if (task != null) {
+            Shell.EXECUTOR.execute(asRunnable(task));
+        }
+    }
+
+    /**
+     * Force stop a root service, creating a task to launch a new root process if needed.
+     * <p>
+     * This method returns a {@link Shell.Task} that has to be executed to launch a
+     * root process if necessary, or else {@code null} will be returned.
+     * @see #stop(Intent)
+     */
+    @MainThread
+    @Nullable
+    public static Shell.Task stopOrTask(@NonNull Intent intent) {
+        return RootServiceManager.getInstance().createStopTask(intent);
+    }
+
+    private static Runnable asRunnable(Shell.Task task) {
+        return () -> {
+            try {
+                Shell shell = Shell.getShell();
+                if (shell.isRoot()) {
+                    shell.execTask(task);
+                }
+            } catch (IOException e) {
+                Utils.err(e);
+            }
+        };
     }
 
     public RootService() {
@@ -133,19 +207,28 @@ public abstract class RootService extends ContextWrapper {
     }
 
     @Override
-    @CallSuper
-    protected void attachBaseContext(Context base) {
-        super.attachBaseContext(base);
+    protected final void attachBaseContext(Context base) {
+        super.attachBaseContext(onAttach(Utils.getContextImpl(base)));
         RootServiceServer.getInstance(base).register(this);
         onCreate();
     }
 
     /**
+     * Called when the RootService is getting attached with a {@link Context}.
+     * @param base the context being attached.
+     * @return the passed in context by default.
+     */
+    @NonNull
+    protected Context onAttach(@NonNull Context base) {
+        return base;
+    }
+
+    /**
      * Return the component name that will be used for service lookup.
      * <p>
-     * Overriding this method is only for very unusual situations when a different
+     * Overriding this method is only for very unusual use cases when a different
      * component name other than the actual class name is desired.
-     * @return the desired component name
+     * @return the desired component name.
      */
     @NonNull
     public ComponentName getComponentName() {
@@ -154,7 +237,7 @@ public abstract class RootService extends ContextWrapper {
 
     @Override
     public final Context getApplicationContext() {
-        return getBaseContext();
+        return Utils.getContext();
     }
 
     /**
@@ -185,11 +268,25 @@ public abstract class RootService extends ContextWrapper {
     public void onDestroy() {}
 
     /**
-     * Force stop this root service process.
-     * <p>
-     * This is the same as calling {@link #stop(Intent)} for this particular service.
+     * Force stop this root service.
      */
     public final void stopSelf() {
         RootServiceServer.getInstance(this).selfStop(getComponentName());
+    }
+
+    // Deprecated APIs
+
+    /**
+     * @deprecated use {@link #bindOrTask(Intent, Executor, ServiceConnection)}
+     */
+    @MainThread
+    @Nullable
+    @Deprecated
+    public static Runnable createBindTask(
+            @NonNull Intent intent,
+            @NonNull Executor executor,
+            @NonNull ServiceConnection conn) {
+        Shell.Task task = bindOrTask(intent, executor, conn);
+        return task == null ? null : asRunnable(task);
     }
 }

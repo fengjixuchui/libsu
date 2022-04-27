@@ -16,19 +16,26 @@
 
 package com.topjohnwu.superuser.io;
 
+import static com.topjohnwu.superuser.ShellUtils.escapedString;
+
 import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 
 import com.topjohnwu.superuser.Shell;
 import com.topjohnwu.superuser.ShellUtils;
+import com.topjohnwu.superuser.internal.FileImpl;
+import com.topjohnwu.superuser.internal.IOFactory;
+import com.topjohnwu.superuser.internal.Utils;
+import com.topjohnwu.superuser.nio.ExtendedFile;
+import com.topjohnwu.superuser.nio.FileSystemManager;
 
 import java.io.File;
-import java.io.FileFilter;
 import java.io.FilenameFilter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedList;
 import java.util.List;
@@ -45,37 +52,61 @@ import java.util.Locale;
  * <p>
  * Each method description in this class will list out its required commands.
  * The following commands exist on all Android versions: {@code rm}, {@code rmdir},
- * {@code mv}, {@code ls}, and {@code mkdir}.
+ * {@code mv}, {@code ls}, {@code ln}, and {@code mkdir}.
  * The following commands require {@code toybox} on Android 6.0 and higher, or {@code busybox}
  * to support legacy devices: {@code readlink}, {@code touch}, and {@code stat}.
  * <p>
- * This class has handy factory methods {@code SuFile.open(...)} for obtaining {@link File}
+ * This class has a few factory methods {@code SuFile.open(...)} for obtaining {@link File}
  * instances. These factory methods will return a normal {@link File} instance if the main
- * shell does not have root access, or else return a {@link SuFile} instance.
+ * shell does not have root access, or else return a {@link SuFile} instance. Warning: these
+ * factory methods may block the calling thread if a main shell has not been created yet!
  */
-public class SuFile extends File {
+public class SuFile extends FileImpl<SuFile> {
 
     private final String escapedPath;
+    private Shell mShell;
 
-    public static File open(String pathname) {
-        return Shell.rootAccess() ? new SuFile(pathname) : new File(pathname);
+    public static ExtendedFile open(String pathname) {
+        return Utils.isMainShellRoot() ? new SuFile(pathname) :
+                FileSystemManager.getLocal().newFile(pathname);
     }
 
-    public static File open(String parent, String child) {
-        return Shell.rootAccess() ? new SuFile(parent, child) : new File(parent, child);
+    public static ExtendedFile open(String parent, String child) {
+        return Utils.isMainShellRoot() ? new SuFile(parent, child) :
+                FileSystemManager.getLocal().newFile(parent, child);
     }
 
-    public static File open(File parent, String child) {
-        return Shell.rootAccess() ? new SuFile(parent, child) : new File(parent, child);
+    public static ExtendedFile open(File parent, String child) {
+        return Utils.isMainShellRoot() ? new SuFile(parent, child) :
+                FileSystemManager.getLocal().newFile(parent.getPath(), child);
     }
 
-    public static File open(URI uri) {
-        return Shell.rootAccess() ? new SuFile(uri) : new File(uri);
+    public static ExtendedFile open(URI uri) {
+        return Utils.isMainShellRoot() ? new SuFile(uri) :
+                FileSystemManager.getLocal().newFile(new File(uri).getPath());
     }
+
+    private static final Creator<SuFile> CREATOR = new Creator<SuFile>() {
+
+        @Override
+        public SuFile[] createArray(int n) {
+            return new SuFile[n];
+        }
+
+        @Override
+        public SuFile create(SuFile src, String path) {
+            return new SuFile(new File(path));
+        }
+
+        @Override
+        public SuFile createChild(SuFile parent, String name) {
+            return new SuFile(new File(parent, name));
+        }
+    };
 
     SuFile(@NonNull File file) {
-        super(file.getAbsolutePath());
-        escapedPath = ShellUtils.escapedString(getPath());
+        super(file.getAbsolutePath(), CREATOR);
+        escapedPath = escapedString(getPath());
     }
 
     public SuFile(String pathname) {
@@ -96,12 +127,25 @@ public class SuFile extends File {
 
     private String cmd(String c) {
         // Use replace instead of format for performance
-        return ShellUtils.fastCmd(c.replace("@@", escapedPath));
+        return ShellUtils.fastCmd(getShell(), c.replace("@@", escapedPath));
     }
 
     private boolean cmdBool(String c) {
         // Use replace instead of format for performance
-        return ShellUtils.fastCmdResult(c.replace("@@", escapedPath));
+        return ShellUtils.fastCmdResult(getShell(), c.replace("@@", escapedPath));
+    }
+
+    /**
+     * Set the {@code Shell} instance to be used internally for all operations.
+     * This shell is also used in {@link SuFileInputStream}, {@link SuFileOutputStream}, and
+     * {@link SuRandomAccessFile}.
+     */
+    public void setShell(Shell shell) {
+        mShell = shell;
+    }
+
+    public Shell getShell() {
+        return mShell == null ? Shell.getShell() : mShell;
     }
 
     /**
@@ -132,6 +176,36 @@ public class SuFile extends File {
     @Override
     public boolean createNewFile() {
         return cmdBool("[ ! -e @@ ] && echo -n > @@");
+    }
+
+    /**
+     * Creates a new hard link named by this abstract pathname of an existing file
+     * if and only if a file with this name does not yet exist.
+     * <p>
+     * Requires command {@code ln}.
+     * @param existing a path to an existing file.
+     * @return <code>true</code> if the named file does not exist and was successfully
+     *         created; <code>false</code> if the creation failed.
+     */
+    @Override
+    public boolean createNewLink(String existing) {
+        existing = ShellUtils.escapedString(existing);
+        return cmdBool("[ ! -d " + existing + " ] && ln @@ " + existing);
+    }
+
+    /**
+     * Creates a new symbolic link named by this abstract pathname to a target file
+     * if and only if a file with this name does not yet exist.
+     * <p>
+     * Requires command {@code ln}.
+     * @param target the target of the symbolic link.
+     * @return <code>true</code> if the named file does not exist and was successfully
+     *         created; <code>false</code> if the creation failed.
+     */
+    @Override
+    public boolean createNewSymlink(String target) {
+        target = ShellUtils.escapedString(target);
+        return cmdBool("[ ! -d " + target + " ] && ln -s @@ " + target);
     }
 
     /**
@@ -188,12 +262,6 @@ public class SuFile extends File {
         return getPath();
     }
 
-    @NonNull
-    @Override
-    public SuFile getAbsoluteFile() {
-        return this;
-    }
-
     /**
      * Returns the canonical pathname string of this abstract pathname.
      * <p>
@@ -205,24 +273,6 @@ public class SuFile extends File {
     public String getCanonicalPath() {
         String path = cmd("readlink -f @@");
         return path.isEmpty() ? getPath() : path;
-    }
-
-    /**
-     * Returns the canonical form of this abstract pathname.
-     * <p>
-     * Requires command {@code readlink}.
-     * @see File#getCanonicalFile()
-     */
-    @NonNull
-    @Override
-    public SuFile getCanonicalFile() {
-        return new SuFile(getCanonicalPath());
-    }
-
-    @Override
-    public SuFile getParentFile() {
-        String parent = getParent();
-        return parent == null ? null : new SuFile(parent);
     }
 
     private long statFS(String fmt) {
@@ -281,24 +331,43 @@ public class SuFile extends File {
     }
 
     /**
-     * @return true if the abstract pathname denotes a block device.
+     * {@inheritDoc}
      */
+    @Override
     public boolean isBlock() {
         return cmdBool("[ -b @@ ]");
     }
 
     /**
-     * @return true if the abstract pathname denotes a character device.
+     * {@inheritDoc}
      */
+    @Override
     public boolean isCharacter() {
         return cmdBool("[ -c @@ ]");
     }
 
     /**
-     * @return true if the abstract pathname denotes a symbolic link file.
+     * {@inheritDoc}
      */
+    @Override
     public boolean isSymlink() {
         return cmdBool("[ -L @@ ]");
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public boolean isNamedPipe() {
+        return cmdBool("[ -p @@ ]");
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public boolean isSocket() {
+        return cmdBool("[ -S @@ ]");
     }
 
     /**
@@ -362,8 +431,8 @@ public class SuFile extends File {
      */
     @Override
     public boolean renameTo(File dest) {
-        String cmd = "mv -f " + escapedPath + " " + ShellUtils.escapedString(dest.getAbsolutePath());
-        return ShellUtils.fastCmdResult(cmd);
+        String cmd = "mv -f " + escapedPath + " " + escapedString(dest.getAbsolutePath());
+        return ShellUtils.fastCmdResult(getShell(), cmd);
     }
 
     private boolean setPerms(boolean set, boolean ownerOnly, int b) {
@@ -471,7 +540,8 @@ public class SuFile extends File {
         if (!isDirectory())
             return null;
         String cmd = "ls -a " + escapedPath;
-        List<String> out = Shell.su(cmd).to(new LinkedList<>(), null).exec().getOut();
+        List<String> out = getShell().newJob().add(cmd)
+                .to(new LinkedList<>(), null).exec().getOut();
         for (ListIterator<String> it = out.listIterator(); it.hasNext();) {
             String name = it.next();
             if (name.equals(".") || name.equals("..") ||
@@ -482,68 +552,13 @@ public class SuFile extends File {
         return out.toArray(new String[0]);
     }
 
-    /**
-     * Returns an array of abstract pathnames denoting the files in the
-     * directory denoted by this abstract pathname.
-     * <p>
-     * Requires command {@code ls}.
-     * @see File#listFiles()
-     */
-    @Nullable
     @Override
-    public SuFile[] listFiles() {
-        if (!isDirectory())
-            return null;
-        String[] ss = list();
-        if (ss == null) return null;
-        int n = ss.length;
-        SuFile[] fs = new SuFile[n];
-        for (int i = 0; i < n; i++) {
-            fs[i] = new SuFile(this, ss[i]);
-        }
-        return fs;
+    public InputStream openInputStream() throws IOException {
+        return IOFactory.fifoIn(this);
     }
 
-    /**
-     * Returns an array of abstract pathnames denoting the files in the
-     * directory denoted by this abstract pathname that satisfy the specified filter.
-     * <p>
-     * Requires command {@code ls}.
-     * @see File#listFiles(FilenameFilter)
-     */
-    @Nullable
     @Override
-    public SuFile[] listFiles(FilenameFilter filter) {
-        if (!isDirectory())
-            return null;
-        String[] ss = list(filter);
-        if (ss == null) return null;
-        int n = ss.length;
-        SuFile[] fs = new SuFile[n];
-        for (int i = 0; i < n; i++) {
-            fs[i] = new SuFile(this, ss[i]);
-        }
-        return fs;
-    }
-
-    /**
-     * Returns an array of abstract pathnames denoting the files in the
-     * directory denoted by this abstract pathname that satisfy the specified filter.
-     * <p>
-     * Requires command {@code ls}.
-     * @see File#listFiles(FileFilter)
-     */
-    @Nullable
-    @Override
-    public SuFile[] listFiles(FileFilter filter) {
-        String[] ss = list();
-        if (ss == null) return null;
-        ArrayList<SuFile> files = new ArrayList<>();
-        for (String s : ss) {
-            SuFile f = new SuFile(this, s);
-            if ((filter == null) || filter.accept(f))
-                files.add(f);
-        }
-        return files.toArray(new SuFile[0]);
+    public OutputStream openOutputStream(boolean append) throws IOException {
+        return IOFactory.fifoOut(this, append);
     }
 }

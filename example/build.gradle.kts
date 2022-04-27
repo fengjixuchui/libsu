@@ -4,8 +4,8 @@ plugins {
 
 android {
     defaultConfig {
+        minSdk = 21
         applicationId = "com.topjohnwu.libsuexample"
-        minSdk = 18
         versionCode = 1
         versionName ="1.0"
     }
@@ -31,7 +31,7 @@ android {
     }
 
     lint {
-        isAbortOnError = false
+        abortOnError = false
     }
 }
 
@@ -41,4 +41,5 @@ dependencies {
     implementation(project(":io"))
     implementation(project(":busybox"))
     implementation(project(":service"))
+    implementation(project(":nio"))
 }

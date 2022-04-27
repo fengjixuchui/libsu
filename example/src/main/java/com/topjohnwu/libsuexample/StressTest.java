@@ -16,38 +16,41 @@
 
 package com.topjohnwu.libsuexample;
 
+import static android.os.ParcelFileDescriptor.MODE_READ_ONLY;
+import static android.os.ParcelFileDescriptor.MODE_WRITE_ONLY;
 import static com.topjohnwu.libsuexample.MainActivity.TAG;
 
-import android.os.Build;
 import android.util.Log;
 
 import com.topjohnwu.superuser.Shell;
 import com.topjohnwu.superuser.internal.IOFactory;
 import com.topjohnwu.superuser.io.SuFile;
+import com.topjohnwu.superuser.nio.ExtendedFile;
+import com.topjohnwu.superuser.nio.FileSystemManager;
 
-import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.List;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.Random;
 
 public class StressTest {
 
-    private static List<String> console;
-    private static OutputStream out;
+    private static final Random r = new Random();
+
+    private static FileSystemManager fs;
     private static FileCallback callback;
-    private static final byte[] buf = new byte[64 * 1024];
 
     interface FileCallback {
-        void onFile(SuFile file) throws Exception;
+        void onFile(ExtendedFile file) throws Exception;
     }
 
-    public static void perform(List<String> c) {
-        console = c;
+    public static void perform(FileSystemManager s) {
+        fs = s;
         Shell.EXECUTOR.execute(() -> {
             try {
-                run();
+                testShellIO();
+                testRemoteIO();
             } catch (Exception e){
                 Log.d(TAG, "", e);
             } finally {
@@ -58,70 +61,69 @@ public class StressTest {
 
     public static void cancel() {
         // These shall force tons of exceptions and cancel the thread :)
-        console = null;
         callback = null;
-        if (out != null) {
-            try { out.close(); } catch (IOException ignored) {}
-            out = null;
-        }
+        fs = null;
     }
 
-    private static void run() throws Exception {
-        // Change to a more reasonable path if you don't want the
-        // stress test to run forever
-        SuFile root = new SuFile("/system");
+    private static void testShellIO() throws Exception {
+        SuFile root = new SuFile("/system/app");
 
-        // This will stress test excessive root commands as SuFile runs
-        // a bunch of them in a short period of time
+        // Stress test fifo IOStreams
+        OutputStream out = IOFactory.fifoOut(new SuFile("/dev/null"), false);
+        byte[] buf = new byte[64 * 1024];
         callback = file -> {
-            file.isCharacter();
-            file.isBlock();
-            file.isSymlink();
-        };
-        traverse(root);
-
-        if (Build.VERSION.SDK_INT >= 21) {
-            // Stress test FifoOutputStream
-            out = IOFactory.fifoOut(new SuFile("/dev/null"), false);
-
-            // Make sure FifoInputStream works fine
-            callback = file -> {
-                try (InputStream in = IOFactory.fifoIn(file)) {
-                    pump(in);
+            try (InputStream in = IOFactory.fifoIn((SuFile) file)) {
+                for (;;) {
+                    // Randomize read/write length to test unaligned I/O
+                    int len = r.nextInt(buf.length);
+                    int read = in.read(buf, 0, len);
+                    if (read <= 0)
+                        break;
+                    out.write(buf, 0, read);
                 }
-            };
-            traverse(root);
-        } else {
-            // Unfortunately, ShellOutputStream will crash BusyBox ASH :(
-            // This means pre API 21, we cannot properly test root
-            // outputs as CopyOutputStream does not actually pump data
-            // directly to the target file.
-
-            // In my personal environments, removing the BusyBoxInstaller
-            // from shell initializers allows ShellOutputStream to operate
-            // without issues, however due to these reasons, shell I/O
-            // is strongly advised against.
-
-            // /dev/null is writable without root
-            out = new FileOutputStream("/dev/null");
-        }
-
-        // Make sure ShellInputStream works fine
-        callback = file -> {
-            try (InputStream in = IOFactory.shellIn(file)) {
-                pump(in);
+                out.flush();
             }
         };
-        traverse(root);
+        try {
+            traverse(root);
+        } finally {
+            out.close();
+        }
     }
 
-    private static void traverse(SuFile base) throws Exception {
-        console.add(base.getPath());
+    private static void testRemoteIO() throws Exception {
+        ExtendedFile root = fs.newFile("/system/app");
+
+        FileChannel out = fs.openChannel("/dev/null", MODE_WRITE_ONLY);
+        ByteBuffer buf = ByteBuffer.allocateDirect(512 * 1024);
+        callback = file -> {
+            Log.d(TAG, file.getPath());
+            try (FileChannel src = fs.openChannel(file, MODE_READ_ONLY)) {
+                for (;;) {
+                    // Randomize read/write length
+                    int len = r.nextInt(buf.capacity());
+                    buf.limit(len);
+                    if (src.read(buf) <= 0)
+                        break;
+                    buf.flip();
+                    out.write(buf);
+                    buf.clear();
+                }
+            }
+        };
+        try {
+            traverse(root);
+        } finally {
+            out.close();
+        }
+    }
+
+    private static void traverse(ExtendedFile base) throws Exception {
         if (base.isDirectory()) {
-            SuFile[] ls = base.listFiles();
+            ExtendedFile[] ls = base.listFiles();
             if (ls == null)
                 return;
-            for (SuFile file : ls) {
+            for (ExtendedFile file : ls) {
                 traverse(file);
             }
         } else {
@@ -129,16 +131,4 @@ public class StressTest {
         }
     }
 
-    public static void pump(InputStream in) throws IOException {
-        Random r = new Random();
-        for (;;) {
-            // Randomize read/write length to test unaligned I/O
-            int len = r.nextInt(buf.length);
-            int read = in.read(buf, 0, len);
-            if (read <= 0)
-                break;
-            out.write(buf, 0, read);
-        }
-        out.flush();
-    }
 }

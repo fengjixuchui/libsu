@@ -16,29 +16,28 @@
 
 package com.topjohnwu.superuser.internal;
 
-import static com.topjohnwu.superuser.internal.RootServerMain.attachBaseContext;
 import static com.topjohnwu.superuser.internal.RootServerMain.getServiceName;
-import static com.topjohnwu.superuser.internal.RootServiceManager.ACTION_ENV;
-import static com.topjohnwu.superuser.internal.RootServiceManager.BUNDLE_BINDER_KEY;
-import static com.topjohnwu.superuser.internal.RootServiceManager.BUNDLE_DEBUG_KEY;
+import static com.topjohnwu.superuser.internal.RootServiceManager.DEBUG_ENV;
 import static com.topjohnwu.superuser.internal.RootServiceManager.LOGGING_ENV;
-import static com.topjohnwu.superuser.internal.RootServiceManager.MSG_ACK;
 import static com.topjohnwu.superuser.internal.RootServiceManager.MSG_STOP;
 import static com.topjohnwu.superuser.internal.RootServiceManager.TAG;
 import static com.topjohnwu.superuser.internal.Utils.context;
+import static com.topjohnwu.superuser.internal.Utils.newArraySet;
 
+import android.annotation.SuppressLint;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
-import android.os.Bundle;
 import android.os.Debug;
 import android.os.FileObserver;
 import android.os.IBinder;
 import android.os.Message;
 import android.os.Messenger;
 import android.os.RemoteException;
+import android.os.UserHandle;
 import android.util.ArrayMap;
+import android.util.SparseArray;
 
 import androidx.annotation.Nullable;
 import androidx.annotation.RestrictTo;
@@ -48,12 +47,13 @@ import com.topjohnwu.superuser.ipc.RootService;
 
 import java.io.File;
 import java.lang.reflect.Constructor;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
 
 @RestrictTo(RestrictTo.Scope.LIBRARY)
-public class RootServiceServer extends IRootServiceManager.Stub implements IBinder.DeathRecipient {
+public class RootServiceServer extends IRootServiceManager.Stub {
 
     private static RootServiceServer mInstance;
 
@@ -66,75 +66,90 @@ public class RootServiceServer extends IRootServiceManager.Stub implements IBind
 
     @SuppressWarnings("FieldCanBeLocal")
     private final FileObserver observer;  /* A strong reference is required */
-    private final Map<ComponentName, ServiceContainer> activeServices;
-    private Messenger client;
-    private boolean isDaemon = false;
-    private String mAction;
+    private final Map<ComponentName, ServiceContainer> activeServices = new ArrayMap<>();
+    private final SparseArray<ClientProcess> clients = new SparseArray<>();
+    private final boolean isDaemon;
 
+    @SuppressWarnings("rawtypes")
     private RootServiceServer(Context context) {
         Shell.enableVerboseLogging = System.getenv(LOGGING_ENV) != null;
-        mAction = System.getenv(ACTION_ENV);
-        Utils.context = context;
-        if (Build.VERSION.SDK_INT >= 19) {
-            activeServices = new ArrayMap<>();
-        } else {
-            activeServices = new HashMap<>();
-        }
-        observer = new AppObserver(new File(context.getPackageCodePath()));
+        Utils.context = Utils.getContextImpl(context);
 
-        broadcast();
-        observer.startWatching();
-    }
-
-    @Override
-    public void connect(Bundle bundle) {
-        if (client != null)
-            return;
-
-        IBinder binder = bundle.getBinder(BUNDLE_BINDER_KEY);
-        if (binder == null)
-            return;
-        final Messenger c;
-        try {
-            binder.linkToDeath(this, 0);
-            c = new Messenger(binder);
-        } catch (RemoteException e) {
-            Utils.err(TAG, e);
-            return;
-        }
-
-        if (bundle.getBoolean(BUNDLE_DEBUG_KEY, false)) {
+        // Wait for debugger to attach if needed
+        if (System.getenv(DEBUG_ENV) != null) {
             // ActivityThread.attach(true, 0) will set this to system_process
             HiddenAPIs.setAppName(context.getPackageName() + ":root");
             Utils.log(TAG, "Waiting for debugger to be attached...");
             // For some reason Debug.waitForDebugger() won't work, manual spin lock...
             while (!Debug.isDebuggerConnected()) {
-                try { Thread.sleep(200); }
-                catch (InterruptedException ignored) {}
+                try {
+                    // noinspection BusyWait
+                    Thread.sleep(200);
+                } catch (InterruptedException ignored) {}
             }
             Utils.log(TAG, "Debugger attached!");
         }
 
-        Message m = Message.obtain();
-        m.what = MSG_ACK;
-        try {
-            c.send(m);
-            client = c;
-        } catch (RemoteException ignored) {}
+        observer = new AppObserver(new File(context.getPackageCodePath()));
+        observer.startWatching();
+        if (context instanceof Callable) {
+            try {
+                Object[] objs = (Object[]) ((Callable) context).call();
+                isDaemon = (boolean) objs[2];
+                if (isDaemon) {
+                    // Register ourselves as system service
+                    HiddenAPIs.addService(getServiceName(context.getPackageName()), this);
+                }
+                broadcast((int) objs[0], (String) objs[1]);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        } else {
+            throw new IllegalArgumentException("Expected Context to be Callable");
+        }
     }
 
     @Override
-    public void broadcast() {
-        Intent intent = RootServiceManager.getBroadcastIntent(context, mAction, this);
-        context.sendBroadcast(intent);
+    public void connect(IBinder binder) {
+        int uid = getCallingUid();
+        UiThreadHandler.run(() -> connectInternal(uid, binder));
+    }
+
+    private void connectInternal(int uid, IBinder binder) {
+        ClientProcess c = clients.get(uid);
+        if (c != null)
+            return;
+        try {
+            c = new ClientProcess(binder, uid);
+            clients.put(c.mUid, c);
+        } catch (RemoteException e) {
+            Utils.err(TAG, e);
+            return;
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    public void broadcast(int uid, String action) {
+        // Use the UID argument iff caller is root
+        uid = getCallingUid() == 0 ? uid : getCallingUid();
+        Utils.log(TAG, "broadcast to uid=" + uid);
+        Intent intent = RootServiceManager.getBroadcastIntent(this, isDaemon);
+        intent.setAction(action);
+        if (Build.VERSION.SDK_INT >= 24) {
+            UserHandle h = UserHandle.getUserHandleForUid(uid);
+            context.sendBroadcastAsUser(intent, h);
+        } else {
+            context.sendBroadcast(intent);
+        }
     }
 
     @Override
     public IBinder bind(Intent intent) {
         IBinder[] b = new IBinder[1];
+        int uid = getCallingUid();
         UiThreadHandler.runAndWait(() -> {
             try {
-                b[0] = bindInternal(intent);
+                b[0] = bindInternal(uid, intent);
             } catch (Exception e) {
                 Utils.err(TAG, e);
             }
@@ -144,110 +159,102 @@ public class RootServiceServer extends IRootServiceManager.Stub implements IBind
 
     @Override
     public void unbind(ComponentName name) {
+        int uid = getCallingUid();
         UiThreadHandler.run(() -> {
             Utils.log(TAG, name.getClassName() + " unbind");
-            stopService(name, false);
+            unbindService(uid, name);
         });
     }
 
     @Override
-    public void stop(ComponentName name) {
+    public void stop(ComponentName name, int uid, String action) {
+        // Use the UID argument iff caller is root
+        int clientUid = getCallingUid() == 0 ? uid : getCallingUid();
         UiThreadHandler.run(() -> {
             Utils.log(TAG, name.getClassName() + " stop");
-            stopService(name, true);
-            // If no client is connected yet, broadcast anyways
-            if (client == null) {
-                broadcast();
+            unbindService(-1, name);
+            if (action != null) {
+                // If we aren't killed yet, send another broadcast
+                broadcast(clientUid, action);
             }
-        });
-    }
-
-    @Override
-    public void setAction(String action) {
-        mAction = action;
-    }
-
-    @Override
-    public void binderDied() {
-        Messenger c = client;
-        client = null;
-        if (c != null)
-            c.getBinder().unlinkToDeath(this, 0);
-        UiThreadHandler.run(() -> {
-            Utils.log(TAG, "Client process terminated");
-            stopAllService(false);
         });
     }
 
     public void selfStop(ComponentName name) {
         UiThreadHandler.run(() -> {
             Utils.log(TAG, name.getClassName() + " selfStop");
-            stopService(name, true);
-            Messenger c = client;
-            if (c != null) {
-                Message m = Message.obtain();
-                m.what = MSG_STOP;
-                m.obj = name;
-                try {
-                    c.send(m);
-                } catch (RemoteException e) {
-                    Utils.err(TAG, e);
-                }
-            }
+            unbindService(-1, name);
         });
     }
 
     public void register(RootService service) {
-        ServiceContainer c = new ServiceContainer();
-        c.service = service;
-        activeServices.put(service.getComponentName(), c);
+        ServiceContainer s = new ServiceContainer(service);
+        activeServices.put(service.getComponentName(), s);
     }
 
-    private IBinder bindInternal(Intent intent) throws Exception {
+    private IBinder bindInternal(int uid, Intent intent) throws Exception {
+        ClientProcess c = clients.get(uid);
+        if (c == null)
+            return null;
+
         ComponentName name = intent.getComponent();
 
-        ServiceContainer c = activeServices.get(name);
-        if (c == null) {
-            Class<?> clz = Class.forName(name.getClassName());
+        ServiceContainer s = activeServices.get(name);
+        if (s == null) {
+            Class<?> clz = context.getClassLoader().loadClass(name.getClassName());
             Constructor<?> ctor = clz.getDeclaredConstructor();
             ctor.setAccessible(true);
-            attachBaseContext.invoke(ctor.newInstance(), context);
+            HiddenAPIs.attachBaseContext(ctor.newInstance(), context);
 
             // RootService should be registered after attachBaseContext
-            c = activeServices.get(name);
-            if (c == null) {
+            s = activeServices.get(name);
+            if (s == null) {
                 return null;
             }
         }
 
-        if (c.binder != null) {
+        if (s.binder != null) {
             Utils.log(TAG, name.getClassName() + " rebind");
-            c.service.onRebind(c.intent);
+            if (s.rebind)
+                s.service.onRebind(s.intent);
         } else {
             Utils.log(TAG, name.getClassName() + " bind");
-            c.binder = c.service.onBind(intent);
-            c.intent = intent.cloneFilter();
+            s.binder = s.service.onBind(intent);
+            s.intent = intent.cloneFilter();
         }
+        s.users.add(uid);
 
-        return c.binder;
+        return s.binder;
     }
 
-    private void setAsDaemon() {
-        if (!isDaemon) {
-            // Register ourselves as system service
-            HiddenAPIs.addService(getServiceName(context.getPackageName()), this);
-            isDaemon = true;
-        }
-    }
+    private void unbindInternal(ServiceContainer s, int uid, Runnable onDestroy) {
+        boolean hadUsers = !s.users.isEmpty();
+        s.users.remove(uid);
+        if (uid < 0 || s.users.isEmpty()) {
+            if (hadUsers) {
+                s.rebind = s.service.onUnbind(s.intent);
+            }
+            if (uid < 0 || !isDaemon) {
+                s.service.onDestroy();
+                onDestroy.run();
 
-    private void stopService(ComponentName className, boolean force) {
-        ServiceContainer c = activeServices.get(className);
-        if (c != null) {
-            if (!c.service.onUnbind(c.intent) || force) {
-                c.service.onDestroy();
-                activeServices.remove(className);
-            } else {
-                setAsDaemon();
+                // Notify all other users
+                for (int user : s.users) {
+                    ClientProcess c = clients.get(user);
+                    if (c == null)
+                        continue;
+                    Message msg = Message.obtain();
+                    msg.what = MSG_STOP;
+                    msg.arg1 = isDaemon ? 1 : 0;
+                    msg.obj = s.intent.getComponent();
+                    try {
+                        c.m.send(msg);
+                    } catch (RemoteException e) {
+                        Utils.err(TAG, e);
+                    } finally {
+                        msg.recycle();
+                    }
+                }
             }
         }
         if (activeServices.isEmpty()) {
@@ -256,21 +263,24 @@ public class RootServiceServer extends IRootServiceManager.Stub implements IBind
         }
     }
 
-    private void stopAllService(boolean force) {
+    private void unbindService(int uid, ComponentName name) {
+        ServiceContainer s = activeServices.get(name);
+        if (s == null)
+            return;
+        unbindInternal(s, uid, () -> activeServices.remove(name));
+    }
+
+    private void unbindServices(int uid) {
         Iterator<Map.Entry<ComponentName, ServiceContainer>> it =
                 activeServices.entrySet().iterator();
         while (it.hasNext()) {
-            ServiceContainer c = it.next().getValue();
-            if (!c.service.onUnbind(c.intent) || force) {
-                c.service.onDestroy();
-                it.remove();
-            } else {
-                setAsDaemon();
+            ServiceContainer s = it.next().getValue();
+            if (uid < 0) {
+                // App is updated/deleted, all clients will get killed anyways,
+                // no need to notify anyone.
+                s.users.clear();
             }
-        }
-        if (force || activeServices.isEmpty()) {
-            // Terminate root process
-            System.exit(0);
+            unbindInternal(s, uid, it::remove);
         }
     }
 
@@ -290,15 +300,42 @@ public class RootServiceServer extends IRootServiceManager.Stub implements IBind
             if (event == DELETE_SELF || name.equals(path)) {
                 UiThreadHandler.run(() -> {
                     Utils.log(TAG, "App updated, terminate");
-                    stopAllService(true);
+                    unbindServices(-1);
+                    System.exit(0);
                 });
             }
         }
     }
 
+    class ClientProcess extends BinderHolder {
+
+        final Messenger m;
+        final int mUid;
+
+        ClientProcess(IBinder b, int uid) throws RemoteException {
+            super(b);
+            m = new Messenger(b);
+            mUid = uid;
+        }
+
+        @Override
+        protected void onBinderDied() {
+            Utils.log(TAG, "Client process terminated, uid=" + mUid);
+            clients.remove(mUid);
+            unbindServices(mUid);
+        }
+    }
+
     static class ServiceContainer {
-        RootService service;
+        final RootService service;
+        final Set<Integer> users = newArraySet();
+
         Intent intent;
         IBinder binder;
+        boolean rebind;
+
+        ServiceContainer(RootService s) {
+            service = s;
+        }
     }
 }
