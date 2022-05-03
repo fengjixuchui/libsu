@@ -16,12 +16,6 @@
 
 package com.topjohnwu.superuser.internal;
 
-import static android.os.ParcelFileDescriptor.MODE_APPEND;
-import static android.os.ParcelFileDescriptor.MODE_CREATE;
-import static android.os.ParcelFileDescriptor.MODE_READ_ONLY;
-import static android.os.ParcelFileDescriptor.MODE_READ_WRITE;
-import static android.os.ParcelFileDescriptor.MODE_TRUNCATE;
-import static android.os.ParcelFileDescriptor.MODE_WRITE_ONLY;
 import static android.system.OsConstants.ENOSYS;
 import static android.system.OsConstants.O_APPEND;
 import static android.system.OsConstants.O_CREAT;
@@ -29,6 +23,12 @@ import static android.system.OsConstants.O_RDONLY;
 import static android.system.OsConstants.O_RDWR;
 import static android.system.OsConstants.O_TRUNC;
 import static android.system.OsConstants.O_WRONLY;
+import static com.topjohnwu.superuser.nio.FileSystemManager.MODE_APPEND;
+import static com.topjohnwu.superuser.nio.FileSystemManager.MODE_CREATE;
+import static com.topjohnwu.superuser.nio.FileSystemManager.MODE_READ_ONLY;
+import static com.topjohnwu.superuser.nio.FileSystemManager.MODE_READ_WRITE;
+import static com.topjohnwu.superuser.nio.FileSystemManager.MODE_TRUNCATE;
+import static com.topjohnwu.superuser.nio.FileSystemManager.MODE_WRITE_ONLY;
 
 import android.os.Build;
 import android.system.ErrnoException;
@@ -39,7 +39,9 @@ import android.util.MutableLong;
 
 import androidx.annotation.RequiresApi;
 
+import java.io.File;
 import java.io.FileDescriptor;
+import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.OpenOption;
@@ -47,6 +49,8 @@ import java.nio.file.StandardOpenOption;
 import java.util.Set;
 
 class FileUtils {
+
+    private static final String REMOTE_ERR_MSG = "Exception thrown on remote process";
 
     private static Object os;
     private static Method splice;
@@ -60,7 +64,7 @@ class FileUtils {
         boolean append;
     }
 
-    static int pfdModeToPosix(int mode) {
+    static int modeToPosix(int mode) {
         int res;
         if ((mode & MODE_READ_WRITE) == MODE_READ_WRITE) {
             res = O_RDWR;
@@ -84,7 +88,7 @@ class FileUtils {
     }
 
     @RequiresApi(api = 26)
-    static Set<OpenOption> pfdModeToOptions(int mode) {
+    static Set<OpenOption> modeToOptions(int mode) {
         Set<OpenOption> set = new ArraySet<>();
         if ((mode & MODE_READ_WRITE) == MODE_READ_WRITE) {
             set.add(StandardOpenOption.READ);
@@ -108,7 +112,7 @@ class FileUtils {
         return set;
     }
 
-    static Flag pfdModeToFlag(int mode) {
+    static Flag modeToFlag(int mode) {
         Flag f = new Flag();
         if ((mode & MODE_READ_WRITE) == MODE_READ_WRITE) {
             f.read = true;
@@ -188,5 +192,25 @@ class FileUtils {
                 throw new ErrnoException("sendfile", ENOSYS);
             }
         }
+    }
+
+    static void checkException(ParcelValues values) throws IOException {
+        Throwable err = values.getTyped(0);
+        if (err != null) {
+            throw new IOException(REMOTE_ERR_MSG, err);
+        }
+    }
+
+    static <T> T tryAndGet(ParcelValues values) throws IOException {
+        checkException(values);
+        return values.getTyped(1);
+    }
+
+    @SuppressWarnings("OctalInteger")
+    static File createTempFIFO() throws ErrnoException, IOException {
+        File fifo = File.createTempFile("libsu-fifo-", null);
+        fifo.delete();
+        Os.mkfifo(fifo.getPath(), 0644);
+        return fifo;
     }
 }

@@ -21,6 +21,8 @@ import android.system.Os;
 import android.system.OsConstants;
 import android.system.StructStat;
 
+import androidx.annotation.NonNull;
+
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -29,30 +31,28 @@ import java.io.OutputStream;
 
 class LocalFile extends FileImpl<LocalFile> {
 
-    private static final Creator<LocalFile> CREATOR = new Creator<LocalFile>() {
-
-        @Override
-        public LocalFile[] createArray(int n) {
-            return new LocalFile[n];
-        }
-
-        @Override
-        public LocalFile create(LocalFile src, String path) {
-            return new LocalFile(path);
-        }
-
-        @Override
-        public LocalFile createChild(LocalFile parent, String name) {
-            return new LocalFile(parent.getPath(), name);
-        }
-    };
-
     LocalFile(String pathname) {
-        super(pathname, CREATOR);
+        super(pathname);
     }
 
     LocalFile(String parent, String child) {
-        super(parent, child, CREATOR);
+        super(parent, child);
+    }
+
+    @Override
+    protected LocalFile create(String path) {
+        return new LocalFile(path);
+    }
+
+    @NonNull
+    @Override
+    public LocalFile getChildFile(String name) {
+        return new LocalFile(getPath(), name);
+    }
+
+    @Override
+    protected LocalFile[] createArray(int n) {
+        return new LocalFile[n];
     }
 
     @Override
@@ -106,12 +106,12 @@ class LocalFile extends FileImpl<LocalFile> {
     }
 
     @Override
-    public InputStream openInputStream() throws IOException {
+    public InputStream newInputStream() throws IOException {
         return new FileInputStream(this);
     }
 
     @Override
-    public OutputStream openOutputStream(boolean append) throws IOException {
+    public OutputStream newOutputStream(boolean append) throws IOException {
         return new FileOutputStream(this, append);
     }
 

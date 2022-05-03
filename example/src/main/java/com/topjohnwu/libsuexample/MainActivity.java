@@ -34,7 +34,6 @@ import android.widget.ScrollView;
 import androidx.annotation.NonNull;
 
 import com.topjohnwu.libsuexample.databinding.ActivityMainBinding;
-import com.topjohnwu.superuser.BusyBoxInstaller;
 import com.topjohnwu.superuser.CallbackList;
 import com.topjohnwu.superuser.Shell;
 import com.topjohnwu.superuser.ipc.RootService;
@@ -52,8 +51,7 @@ public class MainActivity extends Activity implements Handler.Callback {
         Shell.enableVerboseLogging = BuildConfig.DEBUG;
         Shell.setDefaultBuilder(Shell.Builder.create()
                 .setFlags(Shell.FLAG_REDIRECT_STDERR)
-                // BusyBoxInstaller should come first!
-                .setInitializers(BusyBoxInstaller.class, ExampleInitializer.class)
+                .setInitializers(ExampleInitializer.class)
         );
     }
 
@@ -76,7 +74,7 @@ public class MainActivity extends Activity implements Handler.Callback {
 
     private AIDLConnection aidlConn;
     private AIDLConnection daemonConn;
-    private FileSystemManager remoteFs;
+    private FileSystemManager remoteFS;
 
     class AIDLConnection implements ServiceConnection {
 
@@ -100,8 +98,13 @@ public class MainActivity extends Activity implements Handler.Callback {
                 consoleList.add("AIDL PID : " + ipc.getPid());
                 consoleList.add("AIDL UID : " + ipc.getUid());
                 consoleList.add("AIDL UUID: " + ipc.getUUID());
-                if (!isDaemon)
-                    remoteFs = FileSystemManager.getRemote(ipc.getFS());
+                if (!isDaemon) {
+                    // Get the remote file system service proxy through AIDL
+                    IBinder binder = ipc.getFileSystemService();
+                    // Create a fs manager with the binder proxy.
+                    // We will use this fs manager in our stress test.
+                    remoteFS = FileSystemManager.getRemote(binder);
+                }
             } catch (RemoteException e) {
                 Log.e(TAG, "Remote error", e);
             }
@@ -115,7 +118,7 @@ public class MainActivity extends Activity implements Handler.Callback {
                 daemonConn = null;
             } else {
                 aidlConn = null;
-                remoteFs = null;
+                remoteFS = null;
             }
             refreshUI();
         }
@@ -179,7 +182,7 @@ public class MainActivity extends Activity implements Handler.Callback {
         binding.aidlSvc.setText(aidlConn == null ? "Bind AIDL" : "Unbind AIDL");
         binding.msgSvc.setText(msgConn == null ? "Bind MSG" : "Unbind MSG");
         binding.testDaemon.setText(daemonConn == null ? "Bind Daemon" : "Unbind Daemon");
-        binding.stressTest.setEnabled(remoteFs != null);
+        binding.stressTest.setEnabled(remoteFS != null);
     }
 
     @Override
@@ -260,7 +263,7 @@ public class MainActivity extends Activity implements Handler.Callback {
 
         binding.clear.setOnClickListener(v -> binding.console.setText(""));
 
-        binding.stressTest.setOnClickListener(v -> StressTest.perform(remoteFs));
+        binding.stressTest.setOnClickListener(v -> StressTest.perform(remoteFS));
     }
 
     /**

@@ -37,44 +37,37 @@ class RemoteFile extends FileImpl<RemoteFile> {
 
     private final IFileSystemService fs;
 
-    private static final Creator<RemoteFile> CREATOR = new Creator<RemoteFile>() {
-
-        @Override
-        public RemoteFile[] createArray(int n) {
-            return new RemoteFile[n];
-        }
-
-        @Override
-        public RemoteFile create(RemoteFile src, String path) {
-            return new RemoteFile(src.fs, path);
-        }
-
-        @Override
-        public RemoteFile createChild(RemoteFile parent, String name) {
-            return new RemoteFile(parent.fs, parent.getPath(), name);
-        }
-    };
-
     RemoteFile(IFileSystemService f, String path) {
-        super(path, CREATOR);
+        super(path);
         fs = f;
     }
 
     RemoteFile(IFileSystemService f, String parent, String child) {
-        super(parent, child, CREATOR);
+        super(parent, child);
         fs = f;
+    }
+
+    @Override
+    protected RemoteFile create(String path) {
+        return new RemoteFile(fs, path);
+    }
+
+    @NonNull
+    @Override
+    public RemoteFile getChildFile(String name) {
+        return new RemoteFile(fs, getPath(), name);
+    }
+
+    @Override
+    protected RemoteFile[] createArray(int n) {
+        return new RemoteFile[n];
     }
 
     @Override
     @NonNull
     public String getCanonicalPath() throws IOException {
         try {
-            ParcelValues b = fs.getCanonicalPath(getPath());
-            IOException ex = b.getTyped(0);
-            if (ex != null) {
-                throw ex;
-            }
-            return b.getTyped(1);
+            return FileUtils.tryAndGet(fs.getCanonicalPath(getPath()));
         } catch (RemoteException e) {
             throw new IOException(e);
         }
@@ -201,12 +194,7 @@ class RemoteFile extends FileImpl<RemoteFile> {
     @Override
     public boolean createNewFile() throws IOException {
         try {
-            ParcelValues b = fs.createNewFile(getPath());
-            IOException ex = b.getTyped(0);
-            if (ex != null) {
-                throw ex;
-            }
-            return b.getTyped(1);
+            return FileUtils.tryAndGet(fs.createNewFile(getPath()));
         } catch (RemoteException e) {
             throw new IOException(e);
         }
@@ -215,12 +203,7 @@ class RemoteFile extends FileImpl<RemoteFile> {
     @Override
     public boolean createNewLink(String existing) throws IOException {
         try {
-            ParcelValues b = fs.createLink(getPath(), existing, false);
-            IOException ex = b.getTyped(0);
-            if (ex != null) {
-                throw ex;
-            }
-            return b.getTyped(1);
+            return FileUtils.tryAndGet(fs.createLink(getPath(), existing, false));
         } catch (RemoteException e) {
             throw new IOException(e);
         }
@@ -229,12 +212,7 @@ class RemoteFile extends FileImpl<RemoteFile> {
     @Override
     public boolean createNewSymlink(String target) throws IOException {
         try {
-            ParcelValues b = fs.createLink(getPath(), target, true);
-            IOException ex = b.getTyped(0);
-            if (ex != null) {
-                throw ex;
-            }
-            return b.getTyped(1);
+            return FileUtils.tryAndGet(fs.createLink(getPath(), target, true));
         } catch (RemoteException e) {
             throw new IOException(e);
         }
@@ -308,42 +286,31 @@ class RemoteFile extends FileImpl<RemoteFile> {
         }
     }
 
-    private boolean setPermission(int access, boolean enable, boolean ownerOnly) {
+    @Override
+    public boolean setWritable(boolean writable, boolean ownerOnly) {
         try {
-            return fs.setPermission(getPath(), access, enable, ownerOnly);
+            return fs.setWritable(getPath(), writable, ownerOnly);
         } catch (RemoteException e) {
             return false;
         }
     }
 
     @Override
-    public boolean setWritable(boolean writable, boolean ownerOnly) {
-        return setPermission(0x2, writable, ownerOnly);
-    }
-
-    @Override
-    public boolean setWritable(boolean writable) {
-        return setPermission(0x2, writable, true);
-    }
-
-    @Override
     public boolean setReadable(boolean readable, boolean ownerOnly) {
-        return setPermission(0x4, readable, ownerOnly);
-    }
-
-    @Override
-    public boolean setReadable(boolean readable) {
-        return setPermission(0x4, readable, true);
+        try {
+            return fs.setReadable(getPath(), readable, ownerOnly);
+        } catch (RemoteException e) {
+            return false;
+        }
     }
 
     @Override
     public boolean setExecutable(boolean executable, boolean ownerOnly) {
-        return setPermission(0x1, executable, ownerOnly);
-    }
-
-    @Override
-    public boolean setExecutable(boolean executable) {
-        return setPermission(0x1, executable, true);
+        try {
+            return fs.setExecutable(getPath(), executable, ownerOnly);
+        } catch (RemoteException e) {
+            return false;
+        }
     }
 
     @Override
@@ -374,12 +341,12 @@ class RemoteFile extends FileImpl<RemoteFile> {
     }
 
     @Override
-    public InputStream openInputStream() throws IOException {
+    public InputStream newInputStream() throws IOException {
         return Channels.newInputStream(new RemoteFileChannel(fs, this, MODE_READ_ONLY));
     }
 
     @Override
-    public OutputStream openOutputStream(boolean append) throws IOException {
+    public OutputStream newOutputStream(boolean append) throws IOException {
         int mode = MODE_WRITE_ONLY | MODE_CREATE;
         if (append)
             mode |= MODE_APPEND;

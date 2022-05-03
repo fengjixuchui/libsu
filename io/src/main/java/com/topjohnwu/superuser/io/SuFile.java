@@ -19,16 +19,17 @@ package com.topjohnwu.superuser.io;
 import static com.topjohnwu.superuser.ShellUtils.escapedString;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.topjohnwu.superuser.Shell;
 import com.topjohnwu.superuser.ShellUtils;
-import com.topjohnwu.superuser.internal.FileImpl;
 import com.topjohnwu.superuser.internal.IOFactory;
 import com.topjohnwu.superuser.internal.Utils;
 import com.topjohnwu.superuser.nio.ExtendedFile;
 import com.topjohnwu.superuser.nio.FileSystemManager;
 
 import java.io.File;
+import java.io.FileFilter;
 import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.InputStream;
@@ -36,6 +37,7 @@ import java.io.OutputStream;
 import java.net.URI;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedList;
 import java.util.List;
@@ -61,51 +63,33 @@ import java.util.Locale;
  * shell does not have root access, or else return a {@link SuFile} instance. Warning: these
  * factory methods may block the calling thread if a main shell has not been created yet!
  */
-public class SuFile extends FileImpl<SuFile> {
+public class SuFile extends ExtendedFile {
 
     private final String escapedPath;
     private Shell mShell;
 
     public static ExtendedFile open(String pathname) {
         return Utils.isMainShellRoot() ? new SuFile(pathname) :
-                FileSystemManager.getLocal().newFile(pathname);
+                FileSystemManager.getLocal().getFile(pathname);
     }
 
     public static ExtendedFile open(String parent, String child) {
         return Utils.isMainShellRoot() ? new SuFile(parent, child) :
-                FileSystemManager.getLocal().newFile(parent, child);
+                FileSystemManager.getLocal().getFile(parent, child);
     }
 
     public static ExtendedFile open(File parent, String child) {
         return Utils.isMainShellRoot() ? new SuFile(parent, child) :
-                FileSystemManager.getLocal().newFile(parent.getPath(), child);
+                FileSystemManager.getLocal().getFile(parent.getPath(), child);
     }
 
     public static ExtendedFile open(URI uri) {
         return Utils.isMainShellRoot() ? new SuFile(uri) :
-                FileSystemManager.getLocal().newFile(new File(uri).getPath());
+                FileSystemManager.getLocal().getFile(new File(uri).getPath());
     }
 
-    private static final Creator<SuFile> CREATOR = new Creator<SuFile>() {
-
-        @Override
-        public SuFile[] createArray(int n) {
-            return new SuFile[n];
-        }
-
-        @Override
-        public SuFile create(SuFile src, String path) {
-            return new SuFile(new File(path));
-        }
-
-        @Override
-        public SuFile createChild(SuFile parent, String name) {
-            return new SuFile(new File(parent, name));
-        }
-    };
-
     SuFile(@NonNull File file) {
-        super(file.getAbsolutePath(), CREATOR);
+        super(file.getAbsolutePath());
         escapedPath = escapedString(getPath());
     }
 
@@ -123,6 +107,20 @@ public class SuFile extends FileImpl<SuFile> {
 
     public SuFile(URI uri) {
         this(new File(uri));
+    }
+
+    private SuFile create(String path) {
+        SuFile s = new SuFile(path);
+        s.mShell = mShell;
+        return s;
+    }
+
+    @NonNull
+    @Override
+    public SuFile getChildFile(String name) {
+        SuFile s = new SuFile(this, name);
+        s.mShell = mShell;
+        return s;
     }
 
     private String cmd(String c) {
@@ -262,6 +260,12 @@ public class SuFile extends FileImpl<SuFile> {
         return getPath();
     }
 
+    @NonNull
+    @Override
+    public SuFile getAbsoluteFile() {
+        return this;
+    }
+
     /**
      * Returns the canonical pathname string of this abstract pathname.
      * <p>
@@ -273,6 +277,24 @@ public class SuFile extends FileImpl<SuFile> {
     public String getCanonicalPath() {
         String path = cmd("readlink -f @@");
         return path.isEmpty() ? getPath() : path;
+    }
+
+    /**
+     * Returns the canonical form of this abstract pathname.
+     * <p>
+     * Requires command {@code readlink}.
+     * @see File#getCanonicalFile()
+     */
+    @NonNull
+    @Override
+    public SuFile getCanonicalFile() {
+        return create(getCanonicalPath());
+    }
+
+    @Override
+    public SuFile getParentFile() {
+        String parent = getParent();
+        return parent == null ? null : create(parent);
     }
 
     private long statFS(String fmt) {
@@ -552,13 +574,81 @@ public class SuFile extends FileImpl<SuFile> {
         return out.toArray(new String[0]);
     }
 
+    /**
+     * Returns an array of abstract pathnames denoting the files in the
+     * directory denoted by this abstract pathname.
+     * <p>
+     * Requires command {@code ls}.
+     * @see File#listFiles()
+     */
+    @Nullable
     @Override
-    public InputStream openInputStream() throws IOException {
+    public SuFile[] listFiles() {
+        if (!isDirectory())
+            return null;
+        String[] ss = list();
+        if (ss == null)
+            return null;
+        int n = ss.length;
+        SuFile[] fs = new SuFile[n];
+        for (int i = 0; i < n; i++) {
+            fs[i] = getChildFile(ss[i]);
+        }
+        return fs;
+    }
+
+    /**
+     * Returns an array of abstract pathnames denoting the files in the
+     * directory denoted by this abstract pathname that satisfy the specified filter.
+     * <p>
+     * Requires command {@code ls}.
+     * @see File#listFiles(FilenameFilter)
+     */
+    @Nullable
+    @Override
+    public SuFile[] listFiles(FilenameFilter filter) {
+        if (!isDirectory())
+            return null;
+        String[] ss = list(filter);
+        if (ss == null)
+            return null;
+        int n = ss.length;
+        SuFile[] fs = new SuFile[n];
+        for (int i = 0; i < n; i++) {
+            fs[i] = getChildFile(ss[i]);
+        }
+        return fs;
+    }
+
+    /**
+     * Returns an array of abstract pathnames denoting the files in the
+     * directory denoted by this abstract pathname that satisfy the specified filter.
+     * <p>
+     * Requires command {@code ls}.
+     * @see File#listFiles(FileFilter)
+     */
+    @Nullable
+    @Override
+    public SuFile[] listFiles(FileFilter filter) {
+        String[] ss = list();
+        if (ss == null)
+            return null;
+        ArrayList<SuFile> files = new ArrayList<>();
+        for (String s : ss) {
+            SuFile f = getChildFile(s);
+            if ((filter == null) || filter.accept(f))
+                files.add(f);
+        }
+        return files.toArray(new SuFile[0]);
+    }
+
+    @Override
+    public InputStream newInputStream() throws IOException {
         return IOFactory.fifoIn(this);
     }
 
     @Override
-    public OutputStream openOutputStream(boolean append) throws IOException {
+    public OutputStream newOutputStream(boolean append) throws IOException {
         return IOFactory.fifoOut(this, append);
     }
 }

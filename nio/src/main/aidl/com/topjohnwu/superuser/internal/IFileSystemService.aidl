@@ -18,8 +18,10 @@ interface IFileSystemService {
     boolean mkdirs(String path);
     boolean renameTo(String path, String dest);
     boolean setLastModified(String path, long time);
-    boolean setPermission(String path, int access, boolean enable, boolean ownerOnly);
     boolean setReadOnly(String path);
+    boolean setWritable(String path, boolean writable, boolean ownerOnly);
+    boolean setReadable(String path, boolean readable, boolean ownerOnly);
+    boolean setExecutable(String path, boolean executable, boolean ownerOnly);
     boolean checkAccess(String path, int access);
     long getTotalSpace(String path);
     long getFreeSpace(String path);
@@ -28,6 +30,7 @@ interface IFileSystemService {
     /* (err, bool) */ ParcelValues createLink(String link, String target, boolean soft);
 
     // I/O APIs
+    oneway void register(IBinder client);
     /* (err, int) */ ParcelValues open(String path, int mode, String fifo);
     oneway void close(int handle);
     /* (err, int) */ ParcelValues pread(int handle, int len, long offset);
