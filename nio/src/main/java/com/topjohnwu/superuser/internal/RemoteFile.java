@@ -16,12 +16,7 @@
 
 package com.topjohnwu.superuser.internal;
 
-import static android.os.ParcelFileDescriptor.MODE_APPEND;
-import static android.os.ParcelFileDescriptor.MODE_CREATE;
-import static android.os.ParcelFileDescriptor.MODE_READ_ONLY;
-import static android.os.ParcelFileDescriptor.MODE_TRUNCATE;
-import static android.os.ParcelFileDescriptor.MODE_WRITE_ONLY;
-
+import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.system.OsConstants;
 
@@ -31,7 +26,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.channels.Channels;
 
 class RemoteFile extends FileImpl<RemoteFile> {
 
@@ -340,18 +334,33 @@ class RemoteFile extends FileImpl<RemoteFile> {
         }
     }
 
+    @NonNull
     @Override
     public InputStream newInputStream() throws IOException {
-        return Channels.newInputStream(new RemoteFileChannel(fs, this, MODE_READ_ONLY));
+        ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+        try {
+            FileUtils.checkException(fs.openReadStream(getPath(), pipe[1]));
+        } catch (RemoteException e) {
+            pipe[0].close();
+            throw new IOException(e);
+        } finally {
+            pipe[1].close();
+        }
+        return new ParcelFileDescriptor.AutoCloseInputStream(pipe[0]);
     }
 
+    @NonNull
     @Override
     public OutputStream newOutputStream(boolean append) throws IOException {
-        int mode = MODE_WRITE_ONLY | MODE_CREATE;
-        if (append)
-            mode |= MODE_APPEND;
-        else
-            mode |= MODE_TRUNCATE;
-        return Channels.newOutputStream(new RemoteFileChannel(fs, this, mode));
+        ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+        try {
+            FileUtils.checkException(fs.openWriteStream(getPath(), pipe[0], append));
+        } catch (RemoteException e) {
+            pipe[1].close();
+            throw new IOException(e);
+        } finally {
+            pipe[0].close();
+        }
+        return new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]);
     }
 }
